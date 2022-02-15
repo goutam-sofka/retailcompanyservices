@@ -1,0 +1,200 @@
+service: ordermgmt-service-api
+frameworkVersion: "2"
+  
+plugins:
+  - serverless-dotenv-plugin
+  - serverless-offline
+  - serverless-pseudo-parameters
+  
+provider:
+  name: aws
+  runtime: nodejs12.x
+  stage: ${env:ENVIRONMENT}
+  region: us-east-1
+  apiName: ${self:service}
+  stackName: ${self:service}
+  timeout: 30 # default is 6 seconds
+  logRetentionInDays: 90 # Set the default RetentionInDays for a CloudWatch LogGroup
+  versionFunctions: false
+  tracing: 
+    apiGateway: true
+    lambda: true
+  httpApi:
+    cors: true
+  iamRoleStatements:
+    - Effect: 'Allow'
+      Action:
+        - "SQS:SendMessage"
+        - "SQS:SendMessageBatch"
+        - "SQS:ReceiveMessage"
+        - "SQS:DeleteMessage"
+      Resource:
+        - !GetAtt CreateNewOrderQueue.Arn
+        - !GetAtt CreateNewOrderDLQueue.Arn
+        - !GetAtt CreateNewOrderManualDLQueue.Arn
+    - Effect: Allow
+      Action:
+        - "dynamodb:PutItem"
+        - "dynamodb:GetItem"
+        - "dynamodb:DeleteItem"
+        - "dynamodb:UpdateItem"
+        - "dynamodb:Scan"
+      Resource: 
+        - !GetAtt InventoryTable.Arn
+        - !GetAtt OrderTable.Arn
+        - !GetAtt CommandTable.Arn
+    - Effect: Allow
+      Action:
+        - "events:PutEvents"
+      Resource: "*"
+    - Effect: "Allow"
+      Action:
+        - sns:Publish
+      Resource:
+        - !GetAtt OrderAllCommandsTopic.Arn
+
+  environment:
+    ENVIRONMENT: ${env:ENVIRONMENT}
+    ORDER_CORE_DYNAMODB_INVENTORYTABLE: !Ref InventoryTable
+    ORDER_CORE_DYNAMODB_ORDERTABLE : !Ref OrderTable
+    COMMAND_TABLE : !Ref CommandTable
+    SENDALL_COMMANDS_URL: !Ref OrderAllCommandsTopic
+    COMMAND_URL_CREATEORDER : !Ref CreateNewOrderQueue
+    COMMAND_URL_NOTPROCESSED_CREATEORDER: !Ref CreateNewOrderManualDLQueue
+
+package:
+  individually: true
+  patterns:
+    - "!test/**/*"
+    - "environments/.env.${env:ENVIRONMENT}"
+
+custom:
+  serverless-offline-ssm:
+    stages:
+      - local
+  environment:
+    develop: develop
+    dev: qa
+    stg: staging
+    training: training
+    prod: production
+  secrets: ${ssm:/aws/reference/secretsmanager/${env:ENVIRONMENT}/${self:service}/secrets~true}    
+
+
+functions:
+  api:
+    patterns:
+      - "environments/**"
+    environment:
+      ENVIRONMENT: "${env:ENVIRONMENT}"
+
+    handler: "server.handler"
+    tracing: "Active"
+    events:
+      - http: "ANY /"
+      - http: "ANY /{proxy+}"
+      - cors: true
+  
+  processneworder:
+    handler: "src/entrypoints/events/aws-lambdas/command-processor/ProcessCreateNewOrderCommand.handler"
+    timeout: 30 
+    events:
+      - sqs:
+          arn: !GetAtt CreateNewOrderQueue.Arn
+          batchSize: 5
+          maximumBatchingWindow: 15      
+    environment:
+      ORDER_CORE_DYNAMODB_ORDERTABLE : !Ref OrderTable
+      COMMAND_TABLE : !Ref CommandTable 
+
+resources:
+  Resources:
+    ## Local SNS Resources
+    OrderAllCommandsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:provider.stackName}-orderallcommands
+
+    #SQS Resources
+    CreateNewOrderQueue:
+      Type: "AWS::SQS::Queue"	
+      Properties:	
+        QueueName: ${self:provider.stackName}-createneworder	
+        RedrivePolicy:	
+          deadLetterTargetArn:	
+            "Fn::GetAtt":	
+              - CreateNewOrderDLQueue	
+              - Arn	
+          maxReceiveCount: 20 
+      
+    CreateNewOrderDLQueue:	
+      Type: "AWS::SQS::Queue"	
+      Properties:	
+        QueueName: ${self:provider.stackName}-createneworder-dlq
+        MessageRetentionPeriod: 1209600 ### 14 days of retention
+    
+    CreateNewOrderManualDLQueue:	
+      Type: "AWS::SQS::Queue"	
+      Properties:	
+        QueueName: ${self:provider.stackName}-createneworder-dlqman 
+        MessageRetentionPeriod: 1209600 ### 14 days of retention
+
+    # ## SNS-SQS Subscriptions Local
+    NewOrderCommandSubscription:
+      Type: "AWS::SNS::Subscription"
+      Properties:
+        TopicArn: !Ref OrderAllCommandsTopic
+        Endpoint: !GetAtt
+          - CreateNewOrderQueue
+          - Arn
+        Protocol: sqs
+        RawMessageDelivery: "true"
+
+    
+    #DynamoDB Resources
+    #### DynamoDB Resources for Inventory/Order table simulations
+    InventoryTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      Properties:
+        TableName: "${self:provider.stackName}-iteminventory"
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 10
+          WriteCapacityUnits: 10
+
+
+    OrderTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      Properties:
+        TableName: "${self:provider.stackName}-orders"
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 10
+          WriteCapacityUnits: 10   
+    
+    CommandTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      Properties:
+        TableName: "${self:provider.stackName}-commands"
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 10
+          WriteCapacityUnits: 10  
